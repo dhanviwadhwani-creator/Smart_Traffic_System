@@ -1,27 +1,63 @@
-import sqlite3
 import os
 import base64
 import uuid
+import time
 from datetime import datetime
 
 import requests
-from flask import Flask, jsonify, request, send_from_directory
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request, redirect
 from flask_cors import CORS
+
+load_dotenv()
+
+DATABASE_URL = os.getenv('DATABASE_URL')
+SUPABASE_URL = (os.getenv('SUPABASE_URL') or '').rstrip('/')
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
+BUCKET = 'report-photos'
+
+if not DATABASE_URL or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise SystemExit(
+        'Missing settings in .env. Need DATABASE_URL, SUPABASE_URL and SUPABASE_SERVICE_KEY.'
+    )
 
 app = Flask(__name__)
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # max 10 MB per request
 
-DB_NAME = 'traffic.db'
 CITY_CONTEXT = 'Kota, Rajasthan, India'
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL)
+
+
+def photo_public_url(photo_name):
+    return f'{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{photo_name}'
+
+
+def upload_photo(image_bytes):
+    """Upload image bytes to the Supabase bucket. Returns the file name, or None on failure."""
+    photo_name = uuid.uuid4().hex + '.jpg'
+    try:
+        response = requests.post(
+            f'{SUPABASE_URL}/storage/v1/object/{BUCKET}/{photo_name}',
+            headers={
+                'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+                'apikey': SUPABASE_SERVICE_KEY,
+                'Content-Type': 'image/jpeg',
+            },
+            data=image_bytes,
+            timeout=30,
+        )
+        if response.status_code in (200, 201):
+            return photo_name
+        print('Photo upload failed:', response.status_code, response.text)
+    except Exception as e:
+        print('Photo upload failed:', e)
+    return None
 
 
 def geocode(address):
@@ -44,36 +80,34 @@ def geocode(address):
 
 def init_db():
     conn = get_db()
-    conn.execute(
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
         '''
         CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             phone TEXT NOT NULL,
             address TEXT NOT NULL,
             severity TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            lat DOUBLE PRECISION,
+            lng DOUBLE PRECISION,
+            photo TEXT
         )
         '''
     )
-
-    # Add lat/lng/photo columns to older databases that don't have them yet
-    columns = [row['name'] for row in conn.execute('PRAGMA table_info(reports)')]
-    if 'lat' not in columns:
-        conn.execute('ALTER TABLE reports ADD COLUMN lat REAL')
-    if 'lng' not in columns:
-        conn.execute('ALTER TABLE reports ADD COLUMN lng REAL')
-    if 'photo' not in columns:
-        conn.execute('ALTER TABLE reports ADD COLUMN photo TEXT')
     conn.commit()
 
-    # Fill coordinates for reports saved before geocoding existed
-    rows = conn.execute('SELECT id, address FROM reports WHERE lat IS NULL').fetchall()
+    # Fill coordinates for any reports that don't have them yet
+    cur.execute('SELECT id, address FROM reports WHERE lat IS NULL')
+    rows = cur.fetchall()
     for row in rows:
         lat, lng = geocode(row['address'])
         if lat is not None:
-            conn.execute('UPDATE reports SET lat = ?, lng = ? WHERE id = ?', (lat, lng, row['id']))
+            cur.execute('UPDATE reports SET lat = %s, lng = %s WHERE id = %s', (lat, lng, row['id']))
+        time.sleep(1)  # Nominatim allows about 1 request per second
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -98,28 +132,28 @@ def add_report():
     if severity not in ('Low', 'Moderate', 'Heavy'):
         return jsonify({'error': 'severity must be Low, Moderate or Heavy'}), 400
 
-    # Save the photo (if any) as a file and keep only its name in the database
+    # Upload the photo (if any) to Supabase Storage, keep only its name in the database
     photo_name = None
     if photo_b64:
         try:
             image_bytes = base64.b64decode(photo_b64)
-            photo_name = uuid.uuid4().hex + '.jpg'
-            with open(os.path.join(UPLOAD_DIR, photo_name), 'wb') as f:
-                f.write(image_bytes)
+            photo_name = upload_photo(image_bytes)
         except Exception as e:
-            print('Photo save failed:', e)
+            print('Photo decode failed:', e)
             photo_name = None
 
     lat, lng = geocode(address)
 
     conn = get_db()
-    cursor = conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         'INSERT INTO reports (name, phone, address, severity, created_at, lat, lng, photo) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id',
         (name, phone, address, severity, datetime.now().isoformat(timespec='seconds'), lat, lng, photo_name),
     )
+    report_id = cur.fetchone()[0]
     conn.commit()
-    report_id = cursor.lastrowid
+    cur.close()
     conn.close()
 
     return jsonify({'message': 'Report saved', 'id': report_id, 'lat': lat, 'lng': lng, 'photo': photo_name}), 201
@@ -128,14 +162,18 @@ def add_report():
 @app.route('/api/reports', methods=['GET'])
 def list_reports():
     conn = get_db()
-    rows = conn.execute('SELECT * FROM reports ORDER BY id DESC').fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute('SELECT * FROM reports ORDER BY id DESC')
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return jsonify([dict(row) for row in rows])
 
 
 @app.route('/uploads/<path:filename>')
 def get_upload(filename):
-    return send_from_directory(UPLOAD_DIR, filename)
+    # Photos now live in Supabase Storage; send the app there so old URLs keep working
+    return redirect(photo_public_url(filename))
 
 
 if __name__ == '__main__':
