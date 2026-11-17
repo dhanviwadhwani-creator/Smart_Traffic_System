@@ -8,7 +8,7 @@ import 'package:image_picker/image_picker.dart';
 import 'notification_service.dart';
 
 // 127.0.0.1 works with: adb reverse tcp:5000 tcp:5000 (emulator or USB phone).
-const String backendBaseUrl = 'http://127.0.0.1:5000';
+const String backendBaseUrl = 'https://smart-traffic-system-b0nh.onrender.com';
 
 class ReportTrafficScreen extends StatefulWidget {
   const ReportTrafficScreen({super.key});
